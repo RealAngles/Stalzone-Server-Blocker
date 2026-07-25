@@ -6,11 +6,8 @@
 
 ## Скриншот
 
+<img width="637" height="615" alt="image" src="https://github.com/user-attachments/assets/56359b09-8f19-41c4-bd37-24386a162630" />
 
-```
-<img width="634" height="613" alt="image" src="https://github.com/user-attachments/assets/c31da19d-1466-4913-b4b0-93622459c405" />
-
-```
 
 ---
 
