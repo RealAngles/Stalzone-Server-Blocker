@@ -11,6 +11,14 @@
 
 ---
 
+## Если что-то не работает
+
+Установите пак
+
+All in one c++ - https://www.techpowerup.com/download/visual-c-redistributable-runtime-package-all-in-one/
+
+---
+
 ## Сборка
 
 Для самостоятельной сборки потребуется:
