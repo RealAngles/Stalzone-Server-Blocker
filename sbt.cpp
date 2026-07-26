@@ -18,7 +18,6 @@
 #include <atomic>
 #include <fstream>
 #include <algorithm>
-#include <mutex>
 #include "json.hpp"
 #include "windivert_dynamic.h"
 #include "imgui.h"
@@ -29,6 +28,14 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 using json = nlohmann::json;
+
+class CriticalSectionLock {
+    CRITICAL_SECTION* m_cs;
+public:
+    CriticalSectionLock(CRITICAL_SECTION* cs) : m_cs(cs) { EnterCriticalSection(m_cs); }
+    ~CriticalSectionLock() { LeaveCriticalSection(m_cs); }
+};
+
 HINSTANCE g_hInst;
 HWND g_hWnd;
 struct ServerInfo {
@@ -40,7 +47,7 @@ struct PoolInfo {
     std::wstring region;
     std::vector<ServerInfo> tunnels;
 };
-std::recursive_mutex g_PoolsMutex;
+CRITICAL_SECTION g_PoolsCS;
 std::vector<PoolInfo> g_Pools;
 std::set<std::string> g_SelectedAddresses;
 std::set<std::string> g_ExpandedPools;
@@ -49,12 +56,12 @@ std::atomic<bool> g_bBlocking = false;
 HANDLE g_hDivert = INVALID_HANDLE_VALUE;
 std::thread g_BlockThread;
 const ImVec4 COL_BG = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
-const ImVec4 COL_BTN_BG = ImVec4(153.0f / 255.0f, 50.0f / 255.0f, 204.0f / 255.0f, 1.0f); 
-const ImVec4 COL_BTN_BORDER = ImVec4(255.0f / 255.0f, 0.0f / 255.0f, 255.0f / 255.0f, 1.0f); 
-const ImVec4 COL_BTN_STOP_BG = ImVec4(255.0f / 255.0f, 68.0f / 255.0f, 68.0f / 255.0f, 1.0f); 
-const ImVec4 COL_BTN_STOP_BORDER = ImVec4(255.0f / 255.0f, 0.0f / 255.0f, 0.0f / 255.0f, 1.0f); 
-const ImVec4 COL_TEXT = ImVec4(224.0f / 255.0f, 224.0f / 255.0f, 224.0f / 255.0f, 1.0f); 
-const ImVec4 COL_LIST_BG = ImVec4(10.0f / 255.0f, 10.0f / 255.0f, 10.0f / 255.0f, 1.0f); 
+const ImVec4 COL_BTN_BG = ImVec4(153.0f / 255.0f, 50.0f / 255.0f, 204.0f / 255.0f, 1.0f);
+const ImVec4 COL_BTN_BORDER = ImVec4(255.0f / 255.0f, 0.0f / 255.0f, 255.0f / 255.0f, 1.0f);
+const ImVec4 COL_BTN_STOP_BG = ImVec4(255.0f / 255.0f, 68.0f / 255.0f, 68.0f / 255.0f, 1.0f);
+const ImVec4 COL_BTN_STOP_BORDER = ImVec4(255.0f / 255.0f, 0.0f / 255.0f, 0.0f / 255.0f, 1.0f);
+const ImVec4 COL_TEXT = ImVec4(224.0f / 255.0f, 224.0f / 255.0f, 224.0f / 255.0f, 1.0f);
+const ImVec4 COL_LIST_BG = ImVec4(10.0f / 255.0f, 10.0f / 255.0f, 10.0f / 255.0f, 1.0f);
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
@@ -154,7 +161,7 @@ void SaveSettings() {
     std::vector<std::string> servers;
     std::vector<std::string> names;
     {
-        std::lock_guard<std::recursive_mutex> lock(g_PoolsMutex);
+        CriticalSectionLock lock(&g_PoolsCS);
         for (const auto& addr : g_SelectedAddresses) {
             servers.push_back(addr);
             std::wstring wAddr = Utf8ToWstring(addr);
@@ -327,18 +334,17 @@ void LoadServers() {
         catch (...) {}
         f.close();
     }
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_PoolsMutex);
-        g_Pools = tempPools;
-    }
     std::string ruJsonStr = FetchUrl(L"https://raw.githubusercontent.com/RealAngles/Stalzone-Server-Blocker/refs/heads/main/Servers.json");
     if (!ruJsonStr.empty()) {
         try {
             json j = json::parse(ruJsonStr);
             if (j.contains("pools")) {
-                tempPools.erase(std::remove_if(tempPools.begin(), tempPools.end(), [](const PoolInfo& p) {
-                    return p.region == L"RU";
-                    }), tempPools.end());
+                std::vector<PoolInfo> newPools;
+                for (auto& p : tempPools) {
+                    if (p.region != L"RU") {
+                        newPools.push_back(std::move(p));
+                    }
+                }
                 for (auto& pool : j["pools"]) {
                     PoolInfo pInfo;
                     pInfo.name = Utf8ToWstring(pool.value("name", ""));
@@ -354,26 +360,23 @@ void LoadServers() {
                         }
                     }
                     if (!pInfo.name.empty() && !pInfo.tunnels.empty()) {
-                        tempPools.push_back(pInfo);
+                        newPools.push_back(std::move(pInfo));
                     }
                 }
-                {
-                    std::lock_guard<std::recursive_mutex> lock(g_PoolsMutex);
-                    g_Pools = tempPools;
-                }
+                tempPools = std::move(newPools);
             }
         }
         catch (...) {}
     }
     {
-        std::lock_guard<std::recursive_mutex> lock(g_PoolsMutex);
+        CriticalSectionLock lock(&g_PoolsCS);
+        g_Pools = std::move(tempPools);
         std::set<std::string> validAddresses;
         for (const auto& pool : g_Pools) {
             for (const auto& server : pool.tunnels) {
                 validAddresses.insert(WstringToUtf8(server.address));
             }
         }
-
         bool changed = false;
         for (auto it = g_SelectedAddresses.begin(); it != g_SelectedAddresses.end(); ) {
             if (validAddresses.find(*it) == validAddresses.end()) {
@@ -384,12 +387,11 @@ void LoadServers() {
                 ++it;
             }
         }
-
         if (changed) {
             UpdateBlockingIfActive();
         }
-        SaveSettings();
     }
+    SaveSettings();
 }
 void BlockThreadProc() {
     char addr[256];
@@ -454,26 +456,28 @@ void UpdateBlockingIfActive() {
 }
 bool CustomCheckboxState(const char* label, bool* v, int state) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
-    float square_sz = 28.0f; 
+    float square_sz = 28.0f;
     ImGuiStyle& s = ImGui::GetStyle();
     ImVec2 label_size = ImGui::CalcTextSize(label, NULL, true);
     float width = square_sz + (label_size.x > 0.0f ? s.ItemInnerSpacing.x + label_size.x : 0.0f);
     float height = (square_sz > label_size.y) ? square_sz : label_size.y;
     std::string btn_id = "##btn_";
     btn_id += label;
+    bool current_val = *v;
     bool pressed = ImGui::InvisibleButton(btn_id.c_str(), ImVec2(width, height));
     if (pressed) {
-        *v = !(*v);
+        *v = !current_val;
     }
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     ImU32 bg_col = ImGui::GetColorU32(ImVec4(26.0f / 255.0f, 26.0f / 255.0f, 26.0f / 255.0f, 1.0f));
     draw_list->AddRectFilled(pos, ImVec2(pos.x + square_sz, pos.y + square_sz), bg_col, 4.0f);
-    ImU32 border_col = (state == 2) ? ImGui::GetColorU32(COL_BTN_BORDER) : ImGui::GetColorU32(COL_BTN_BG);
+    int draw_state = current_val ? 2 : state;
+    ImU32 border_col = (draw_state == 2) ? ImGui::GetColorU32(COL_BTN_BORDER) : ImGui::GetColorU32(COL_BTN_BG);
     draw_list->AddRect(pos, ImVec2(pos.x + square_sz, pos.y + square_sz), border_col, 4.0f, 0, 2.0f);
-    if (state == 2) { 
+    if (draw_state == 2) {
         draw_list->AddRectFilled(ImVec2(pos.x + 6.0f, pos.y + 6.0f), ImVec2(pos.x + square_sz - 6.0f, pos.y + square_sz - 6.0f), ImGui::GetColorU32(COL_BTN_BORDER), 2.0f);
     }
-    else if (state == 3) { 
+    else if (draw_state == 3) {
         draw_list->AddRectFilled(ImVec2(pos.x + 8.0f, pos.y + 8.0f), ImVec2(pos.x + square_sz - 8.0f, pos.y + square_sz - 8.0f), ImGui::GetColorU32(COL_BTN_BG), 1.0f);
     }
     if (label_size.x > 0.0f) {
@@ -483,13 +487,15 @@ bool CustomCheckboxState(const char* label, bool* v, int state) {
     return pressed;
 }
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    InitializeCriticalSection(&g_PoolsCS);
     if (!IsUserAnAdmin()) {
         RelaunchAsAdmin();
+        DeleteCriticalSection(&g_PoolsCS);
         return 0;
     }
     InstallSBTDriver();
     g_hInst = hInstance;
-    WNDCLASSW wc = { 0 };
+    WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hbrBackground = CreateSolidBrush(RGB(0, 0, 0));
@@ -505,10 +511,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     HWND hwnd = CreateWindowW(L"SBTImGuiClass", L"Stalzone Server Blocker",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         xPos, yPos, windowWidth, windowHeight, nullptr, nullptr, hInstance, nullptr);
-    if (!hwnd) return 1;
+    if (!hwnd) {
+        DeleteCriticalSection(&g_PoolsCS);
+        return 1;
+    }
     g_hWnd = hwnd;
     if (!CreateDeviceD3D(hwnd)) {
         CleanupDeviceD3D();
+        DeleteCriticalSection(&g_PoolsCS);
         return 1;
     }
     ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -520,8 +530,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     char font_path[MAX_PATH];
     GetWindowsDirectoryA(font_path, MAX_PATH);
     std::string arial_path = std::string(font_path) + "\\Fonts\\arial.ttf";
-    ImFontConfig font_config;
-    font_config.RasterizerMultiply = 1.2f; 
+    ImFontConfig font_config = {};
+    font_config.RasterizerMultiply = 1.2f;
     ImFont* normal_font = io.Fonts->AddFontFromFileTTF(arial_path.c_str(), 17.0f, &font_config, io.Fonts->GetGlyphRangesCyrillic());
     ImFont* title_font = io.Fonts->AddFontFromFileTTF(arial_path.c_str(), 24.0f, &font_config, io.Fonts->GetGlyphRangesCyrillic());
     ImGui::StyleColorsDark();
@@ -544,7 +554,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(31.0f / 255.0f, 31.0f / 255.0f, 31.0f / 255.0f, 1.0f);
     style.Colors[ImGuiCol_FrameBgActive] = ImVec4(40.0f / 255.0f, 40.0f / 255.0f, 40.0f / 255.0f, 1.0f);
     style.Colors[ImGuiCol_Button] = COL_BTN_BG;
-    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(139.0f / 255.0f, 0.0f / 255.0f, 139.0f / 255.0f, 1.0f); 
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(139.0f / 255.0f, 0.0f / 255.0f, 139.0f / 255.0f, 1.0f);
     style.Colors[ImGuiCol_ButtonActive] = COL_BTN_BORDER;
     style.Colors[ImGuiCol_Text] = COL_TEXT;
     style.Colors[ImGuiCol_ScrollbarBg] = COL_LIST_BG;
@@ -587,7 +597,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         ImGui::PopStyleColor();
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 12));
         {
-            std::lock_guard<std::recursive_mutex> lock(g_PoolsMutex);
+            CriticalSectionLock lock(&g_PoolsCS);
             for (auto& pool : g_Pools) {
                 std::string regUtf8 = WstringToUtf8(pool.region);
                 if (regUtf8 != g_CurrentRegion) continue;
@@ -600,10 +610,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                         checkedCount++;
                     }
                 }
-                int poolState = 1; 
+                int poolState = 1;
                 if (totalCount > 0) {
-                    if (checkedCount == totalCount) poolState = 2; 
-                    else if (checkedCount > 0) poolState = 3; 
+                    if (checkedCount == totalCount) poolState = 2;
+                    else if (checkedCount > 0) poolState = 3;
                 }
                 bool isOpen = (g_ExpandedPools.count(poolNameUtf8) > 0);
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
@@ -615,15 +625,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                 }
                 ImGui::PopStyleVar();
                 ImGui::SameLine();
-                bool val = (poolState == 2);
-                if (CustomCheckboxState("##poolcheck", &val, poolState)) {
-                    for (const auto& s : pool.tunnels) {
-                        std::string addrStr = WstringToUtf8(s.address);
-                        if (val) {
-                            g_SelectedAddresses.insert(addrStr);
+                bool poolVal = (poolState == 2);
+                if (CustomCheckboxState("##poolcheck", &poolVal, poolState)) {
+                    if (poolVal) {
+                        for (const auto& s : pool.tunnels) {
+                            g_SelectedAddresses.insert(WstringToUtf8(s.address));
                         }
-                        else {
-                            g_SelectedAddresses.erase(addrStr);
+                    }
+                    else {
+                        for (const auto& s : pool.tunnels) {
+                            g_SelectedAddresses.erase(WstringToUtf8(s.address));
                         }
                     }
                     SaveSettings();
@@ -731,7 +742,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        HRESULT hr = g_pSwapChain->Present(1, 0); 
+        HRESULT hr = g_pSwapChain->Present(1, 0);
         if (hr == DXGI_STATUS_OCCLUDED)
             g_SwapChainOccluded = true;
     }
@@ -743,6 +754,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     CleanupDeviceD3D();
     DestroyWindow(hwnd);
     UnregisterClassW(L"SBTImGuiClass", hInstance);
+    DeleteCriticalSection(&g_PoolsCS);
     return 0;
 }
 bool CreateDeviceD3D(HWND hWnd) {
@@ -765,7 +777,7 @@ bool CreateDeviceD3D(HWND hWnd) {
     D3D_FEATURE_LEVEL featureLevel;
     const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
     HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
-    if (res == DXGI_ERROR_UNSUPPORTED) 
+    if (res == DXGI_ERROR_UNSUPPORTED)
         res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
     if (res != S_OK)
         return false;
@@ -793,7 +805,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return true;
     switch (msg) {
     case WM_SYSCOMMAND:
-        if ((wParam & 0xFFF0) == SC_KEYMENU) 
+        if ((wParam & 0xFFF0) == SC_KEYMENU)
             return 0;
         break;
     case WM_DESTROY:
