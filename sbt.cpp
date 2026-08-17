@@ -9,6 +9,7 @@
 #endif
 #include <windows.h>
 #include <winhttp.h>
+#include <wincrypt.h>
 #include <d3d11.h>
 #include <tchar.h>
 #include <string>
@@ -250,6 +251,32 @@ bool StartSBTDriver() {
     CloseServiceHandle(hSCM);
     return true;
 }
+std::string GetMD5(const std::string& input) {
+    if (input.empty()) return "";
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    BYTE rgbHash[16];
+    DWORD cbHash = 16;
+    CHAR rgbDigits[] = "0123456789abcdef";
+    std::string md5Str = "";
+
+    if (CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        if (CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
+            if (CryptHashData(hHash, (const BYTE*)input.c_str(), (DWORD)input.length(), 0)) {
+                if (CryptGetHashParam(hHash, HP_HASHVAL, rgbHash, &cbHash, 0)) {
+                    for (DWORD i = 0; i < cbHash; i++) {
+                        md5Str += rgbDigits[rgbHash[i] >> 4];
+                        md5Str += rgbDigits[rgbHash[i] & 0xf];
+                    }
+                }
+            }
+            CryptDestroyHash(hHash);
+        }
+        CryptReleaseContext(hProv, 0);
+    }
+    return md5Str;
+}
+
 std::string FetchUrl(const std::wstring& url) {
     std::string result;
     HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -268,6 +295,8 @@ std::string FetchUrl(const std::wstring& url) {
             DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
             HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
             if (hRequest) {
+                DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+                WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
                 DWORD dwSecurityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                     SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
@@ -302,19 +331,27 @@ void LoadServers() {
     std::vector<PoolInfo> tempPools;
     std::wstring exeDir = GetExeDirW();
     std::wstring serversPath = exeDir + L"\\Servers.json";
+    
+    std::string localJsonStr;
     std::ifstream f(serversPath);
     if (!f.is_open()) {
         f.open("Servers.json");
     }
     if (f.is_open()) {
+        localJsonStr = std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        f.close();
+    }
+
+    if (!localJsonStr.empty()) {
         try {
-            json j;
-            f >> j;
+            json j = json::parse(localJsonStr);
             if (j.contains("pools")) {
                 for (auto& pool : j["pools"]) {
                     PoolInfo pInfo;
                     pInfo.name = Utf8ToWstring(pool.value("name", ""));
-                    pInfo.region = Utf8ToWstring(pool.value("region", ""));
+                    std::string reg = pool.value("region", "RU");
+                    if (reg.empty()) reg = "RU";
+                    pInfo.region = Utf8ToWstring(reg);
                     if (pool.contains("tunnels")) {
                         for (auto& tunnel : pool["tunnels"]) {
                             ServerInfo sInfo;
@@ -332,13 +369,27 @@ void LoadServers() {
             }
         }
         catch (...) {}
-        f.close();
     }
+
+    std::string localMD5 = GetMD5(localJsonStr);
+
     std::string ruJsonStr = FetchUrl(L"https://raw.githubusercontent.com/RealAngles/Stalzone-Server-Blocker/refs/heads/main/Servers.json");
     if (!ruJsonStr.empty()) {
         try {
             json j = json::parse(ruJsonStr);
             if (j.contains("pools")) {
+                std::string remoteMD5 = GetMD5(ruJsonStr);
+                if (localJsonStr.empty() || remoteMD5 != localMD5) {
+                    std::ofstream outFile(serversPath);
+                    if (!outFile.is_open()) {
+                        outFile.open("Servers.json");
+                    }
+                    if (outFile.is_open()) {
+                        outFile << j.dump(2);
+                        outFile.close();
+                    }
+                }
+
                 std::vector<PoolInfo> newPools;
                 for (auto& p : tempPools) {
                     if (p.region != L"RU") {
@@ -348,7 +399,9 @@ void LoadServers() {
                 for (auto& pool : j["pools"]) {
                     PoolInfo pInfo;
                     pInfo.name = Utf8ToWstring(pool.value("name", ""));
-                    pInfo.region = L"RU";
+                    std::string reg = pool.value("region", "RU");
+                    if (reg.empty()) reg = "RU";
+                    pInfo.region = Utf8ToWstring(reg);
                     if (pool.contains("tunnels")) {
                         for (auto& tunnel : pool["tunnels"]) {
                             ServerInfo sInfo;
